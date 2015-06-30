@@ -1,0 +1,13 @@
+{
+  "name": "tweet_profanity",
+  "version": "1.0",
+  "private": true,
+  "scripts": {
+    "start": "node app.js"
+  },
+  "dependencies": {
+    "express": "3.2.6",
+    "jade": "*",
+    "ws": "*"
+  }
+}
