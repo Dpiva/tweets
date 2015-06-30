@@ -1,0 +1,402 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta name="viewport" content="initial-scale=1.0, user-scalable=no">
+    <meta charset="utf-8">
+    <title>Tweets On ThE Map</title>
+    <meta name="description" content="A web application hosted on IBM Bluemix
+    that can monitor on a Google Map the results of a twitter query.
+    The application uses WebSocket protocol, which is supported by IBM Bluemix PaaS.">
+    <meta name="keywords" content="bluemix,twitter,tweets,websocket,developerWorks">
+    <meta name="author" content="Davide Piva">
+    <meta name="title" content="Tweets On ThE Map">
+	<script src="https://ajax.googleapis.com/ajax/libs/jquery/1.11.3/jquery.min.js"></script>
+	<!-- Latest compiled and minified CSS -->
+    <link rel="stylesheet" href="./bootstrap.css" media="screen">
+    <link rel="stylesheet" href="../assets/css/bootswatch.min.css">
+	<!-- Latest compiled and minified JavaScript -->
+	<script src="https://maxcdn.bootstrapcdn.com/bootstrap/3.3.5/js/bootstrap.min.js"></script>
+    <style>
+      html,body{
+		height:100%;
+		}
+
+		#map-canvas {
+			width:100%;
+			height:100%;
+		}
+
+		.navbar-default {
+			margin-bottom:0;
+		}
+			  #panel {
+				position: absolute;
+				top: 5px;
+				left: 50%;
+				margin-left: -180px;
+				z-index: 5;
+				background-color: #fff;
+				padding: 5px;
+				border: 1px solid #999;
+			  }
+			  #panel-monitor {
+				position: absolute;
+				top: 100px;
+				right: 10px;
+				background-color: #fff;
+				padding: 5px;
+				border: 1px solid #999;
+			  }
+    </style>
+    <script src="https://maps.googleapis.com/maps/api/js?v=3.exp"></script>
+    <script>
+
+		var wssearch;
+		var knownLocations = {};
+		var locationsOnTheMap = {};
+		var map;
+		var geocoder;
+		var QltMin = 500;
+		var QltMax = 120000;
+		var qlTimeout = QltMin;
+		var ntweets;
+		var ntweetsinerror;
+		var ntweetsdiscarded;
+		var qtime;
+		var ptimer;
+		var msgq;
+
+		// Update stats panel
+		//
+		function updateStats() {
+		  document.getElementById('num-tweets').value = ntweets;
+		  document.getElementById('num-tweets-in-error').value = ntweetsinerror;
+		  document.getElementById('num-tweets-discarded').value = ntweetsdiscarded;
+		  document.getElementById('tweets-per-sec').value = new Number((ntweets * 1000) / (new Date().getTime() - qtime)).toFixed(2);
+		}
+
+		// Add a delay in writing msgs to the map to mitigate
+		// the query_limit error returned by the geocoder service
+		// when calling it too frequently.
+		//
+		function processMsg() {
+		  var msg = msgq.shift();
+		  if ( msg !== undefined ) {
+			// write to map
+			writeToMap(msg);
+		  }
+		  updateStats();
+		  ptimer = setTimeout(processMsg, qlTimeout);
+		}
+
+		function initialize() {
+		  // Create the map and initialize the geocoder.
+
+		  var mapOptions = {
+			zoom: 3,
+			center: new google.maps.LatLng(37.09024, 0),
+			mapTypeId: google.maps.MapTypeId.TERRAIN
+		  };
+
+		  map = new google.maps.Map(document.getElementById('map-canvas'), mapOptions);
+
+		  geocoder = new google.maps.Geocoder();
+		}
+
+		function dropACircle(loc, tweet) {
+		  var address = loc.adr;
+		  var geoLatLong = loc.geo;
+		  var count = loc.count;
+
+		  var circleOptions = {
+				strokeColor: '#FF0000',
+				strokeOpacity: 0.8,
+				strokeWeight: 2,
+				fillColor: '#FF0000',
+				fillOpacity: 0.35,
+				map: map,
+				center: geoLatLong,
+				position: geoLatLong,
+				title: address,
+				radius: 10000 * count
+		  };
+
+		  var winContent = '<div id="content">'+
+			  '<div id="siteNotice">'+
+			  '</div>'+
+			  '<h1 id="firstHeading" class="firstHeading">' + address + ' (' + count + ')</h1>'+
+			  '<div id="bodyContent"><p>' + tweet + '</p>' +
+			  '</div>'+
+			  '</div>';
+
+		  if ( loc.infowin === undefined ) {
+			loc.infowin = new google.maps.InfoWindow({
+				content: winContent
+			});
+		  } else {
+			loc.infowin.setContent(winContent);
+		  }
+
+		  if ( loc.circle ) {
+			loc.circle.setMap(null);
+			loc.circle = null;
+		  }
+
+		  // Add the circle to the map.
+		  loc.circle = new google.maps.Circle(circleOptions);
+
+		  // Add a listener for the infowindow
+		  google.maps.event.addListener(loc.circle, 'click', function() {
+			loc.infowin.open(map, loc.circle);
+		  });
+
+		  // Add animation effect: bounce a tweet on the circle
+		  var marker = new google.maps.Marker({
+			position: geoLatLong,
+			icon: 'twitter.png',
+			animation: google.maps.Animation.BOUNCE
+		  });
+
+		  // Bounce 2 seconds
+		  marker.setMap(map);
+		  setTimeout(function() {
+			marker.setMap(null);
+			marker = null;
+		  }, 2000);
+
+		  ntweets += 1;
+		}
+
+		function writeToMap(msg) {
+		  // Check known locations first
+		  //
+		  var address = msg.address;
+		  var tweet = msg.text;
+
+		  // Don't waste time if tweet location is unset
+		  //
+		  if ( address.length==0 ) {
+			console.warn('Address not set in tweet. Discarding.');
+			ntweetsinerror+=1;
+
+			// Adjust the timeout of next msg processing
+			if ( qlTimeout > QltMin ) {
+			  qlTimeout /= 2;
+			}
+			return;
+		  }
+
+		  var cloc = knownLocations[address];
+		  if ( cloc === undefined ) {
+			geocoder.geocode( { 'address': address}, function(results, status) {
+			  if (status == google.maps.GeocoderStatus.OK) {
+				// Save to known locations
+				//
+				var fadr = results[0].formatted_address;
+				knownLocations[address] = fadr;
+				if ( locationsOnTheMap[fadr]===undefined ) {
+				  // create the entries
+				  locationsOnTheMap[fadr] = {geo: results[0].geometry.location, adr: fadr, count: 1};
+				} else {
+				  // entry has been created by another call to geocode, just update it
+				  //
+				  locationsOnTheMap[fadr].count++;
+				}
+				dropACircle(locationsOnTheMap[fadr], tweet);
+
+				// Adjust the timeout of next msg processing
+				if ( qlTimeout > QltMin ) {
+				  qlTimeout /= 2;
+				}
+			  } else if ( status == google.maps.GeocoderStatus.OVER_QUERY_LIMIT ) {
+				// Discard the message and slow down processing
+				//
+				ntweetsdiscarded+=1;
+				qlTimeout *= 2;
+				if ( qlTimeout > QltMax ) {
+				  alert('Waiting too long on the geocoder service.');
+				  qlTimeout = QltMin;
+				}
+			  } else {
+				console.warn('Geocode for *' + address + '* was not successful for the following reason: ' + status);
+				ntweetsinerror+=1;
+
+				// Adjust the timeout of next msg processing
+				if ( qlTimeout > QltMin ) {
+				  qlTimeout /= 2;
+				}
+			  }
+			});
+		  } else {
+			console.info('Location *' + address + '* is known. No need to call google geocode service.');
+			locationsOnTheMap[cloc].count++;
+			dropACircle(locationsOnTheMap[cloc], tweet);
+
+			// Adjust the timeout of next msg processing
+			if ( qlTimeout > QltMin ) {
+			  qlTimeout /= 2;
+			}
+		  }
+		}
+
+		function onClose(e) {
+		  alert('Server closed the connection.\nCode: '
+			+ e.code + '\nReason: ' + e.reason + '\nWasClean: ' + e.wasClean);
+
+		  stopProcessing();
+		}
+
+		function onMessage(e) {
+		  // Got a tweet, queue for processing
+		  //
+		  var msg = JSON.parse(e.data);
+		  msgq.push(msg);
+		}
+
+		function onError(e) {
+		  // The onClose() is being called shortly
+		  //
+		  console.error(e);
+		}
+
+		function onOpen(e) {
+		  // Submit the search to the server
+		  //
+		  var search = document.getElementById('search').value.trim();
+		  wssearch.send(search);
+		}
+
+		// Empty the msgq and clear processMsg() schedule
+		//
+		function stopProcessing() {
+		  msgq = [];
+		  if ( ptimer ) {
+			clearInterval(ptimer);
+		  }
+		}
+
+		function startSearch() {
+		  var search = document.getElementById('search').value;
+		  if ( search.trim().length===0 ) {
+			alert('Cannot submit an empty search.');
+			return;
+		  }
+
+		  if ( wssearch ) {
+			wssearch.onclose = function() {};
+			wssearch.close();
+		  }
+
+		  stopProcessing();
+
+		  // Clear the map: loop on locationsOnTheMap and remove circles
+		  //
+		  for (var k in locationsOnTheMap) {
+			locationsOnTheMap[k].count = 0;
+			delete locationsOnTheMap[k].infowin;
+			if ( locationsOnTheMap[k].circle ) {
+			  locationsOnTheMap[k].circle.setMap(null);
+			}
+			delete locationsOnTheMap[k].circle;
+		  }
+
+		  // Reset ptimer
+		  //
+		  qtime = new Date().getTime();
+		  ntweets = 0;
+		  ntweetsinerror = 0;
+		  ntweetsdiscarded = 0;
+
+		  // Create the connection for the new search
+		  //
+		  if ( window.document.location.host.match(/localhost/) ) {
+			var wsUri = 'ws://' + window.document.location.host + '/search';
+		  } else {
+			var wsUri = 'wss://' + window.document.location.host + '/search';
+		  }
+		  wssearch = new WebSocket(wsUri);
+		  wssearch.onopen = function(evt) { onOpen(evt) };
+		  wssearch.onclose = function(evt) { onClose(evt) };
+		  wssearch.onmessage = function(evt) { onMessage(evt) };
+		  wssearch.onerror = function(evt) { onError(evt) };
+
+		  alert('Query ' + search + ' sent.\n You should get tweets bouncing on the map shortly.');
+
+		  // Start processing messages
+		  //
+		  processMsg();
+		}
+
+		google.maps.event.addDomListener(window, 'load', initialize);
+
+    </script>
+  </head>
+  <body>
+  <nav class="navbar navbar-default" role="navigation">
+      <div class="container-fluid">
+        <!-- Brand and toggle get grouped for better mobile display -->
+        <div class="navbar-header">
+          <button type="button" class="navbar-toggle" data-toggle="collapse" data-target="#bs-example-navbar-collapse-1">
+            <span class="sr-only">Toggle navigation</span>
+            <span class="icon-bar"></span>
+            <span class="icon-bar"></span>
+            <span class="icon-bar"></span>
+          </button>
+          <a class="navbar-brand" href="#">Twitter Profanity</a>
+        </div>
+
+        <!-- Collect the nav links, forms, and other content for toggling -->
+        <div class="collapse navbar-collapse" id="bs-example-navbar-collapse-1">
+          <ul class="nav navbar-nav">
+            <li class="active"><a href="#">Link</a></li>
+            <li><a href="#">Link</a></li>
+            <li class="dropdown">
+              <a href="#" class="dropdown-toggle" data-toggle="dropdown">Dropdown <b class="caret"></b></a>
+              <ul class="dropdown-menu">
+                <li><a href="#">Action</a></li>
+                <li><a href="#">Another action</a></li>
+                <li><a href="#">Something else here</a></li>
+                <li class="divider"></li>
+                <li><a href="#">Separated link</a></li>
+                <li class="divider"></li>
+                <li><a href="#">One more separated link</a></li>
+              </ul>
+            </li>
+          </ul>
+          <form class="navbar-form navbar-left" role="search" action="javascript:startSearch();">
+            <div class="form-group">
+              <input id="search" type="search" class="form-control" placeholder="Search"  title="Write a search, click the Search button, and see what's going on on Twitter! Tips: use OR, AND logical operators for multiple-words query">
+            </div>
+            <button type="button" class="btn btn-default" onclick="startSearch()">Search</button>
+          </form>
+          <ul class="nav navbar-nav navbar-right">
+            <li><a href="#">Link</a></li>
+            <li class="dropdown">
+              <a href="#" class="dropdown-toggle" data-toggle="dropdown">Dropdown <b class="caret"></b></a>
+              <ul class="dropdown-menu">
+                <li><a href="#">Action</a></li>
+                <li><a href="#">Another action</a></li>
+                <li><a href="#">Something else here</a></li>
+                <li class="divider"></li>
+                <li><a href="#">Separated link</a></li>
+              </ul>
+            </li>
+          </ul>
+        </div><!-- /.navbar-collapse -->
+      </div><!-- /.container-fluid -->
+    </nav>
+
+    <div id="map-canvas"></div>
+	  <div id="push"></div>
+    <div id="panel-monitor">
+      <div>Tweets on the Map</div>
+      <input id="num-tweets" type="text" readonly title="Number of tweets posted to the map"><br>
+      <div>Tweets in error</div>
+      <input id="num-tweets-in-error" type="text" readonly title="Number of tweets not posted to the map because of invalid location provided"><br>
+      <div>Tweets discarded</div>
+      <input id="num-tweets-discarded" type="text" readonly title="Number of tweets discarded because of errors with the Geocoder service (query limit)"><br>
+      <div>Tweets/secs</div>
+      <input id="tweets-per-sec" type="text" readonly title="Tweets per seconds posted to the map">
+    </div>
+  </body>
+</html>
