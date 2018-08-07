@@ -1,3 +1,3 @@
-# tweets
+# Twitter Profanity
 
-Display tweets on to a map
+Display profanity tweets on to a map
